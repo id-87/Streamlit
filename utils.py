@@ -10,9 +10,6 @@ from nltk.stem import PorterStemmer, WordNetLemmatizer
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import PCA
-from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModel
-import torch
 
 SAMPLE_TEXTS = {
     "Custom / Starter": "Natural Language Processing is amazing! It helps machines understand human language.",
@@ -25,9 +22,6 @@ SAMPLE_TEXTS = {
 _STOPWORDS = None
 _STEMMER = PorterStemmer()
 _LEMMATIZER = WordNetLemmatizer()
-_SENTENCE_MODEL_CACHE = {}
-_CONTEXT_MODEL_CACHE = {}
-_SUBWORD_TOKENIZER_CACHE = {}
 
 
 def ensure_nltk_resources():
@@ -35,14 +29,17 @@ def ensure_nltk_resources():
         ("corpora/stopwords", "stopwords"),
         ("corpora/wordnet", "wordnet"),
         ("corpora/omw-1.4", "omw-1.4"),
-        ("tokenizers/punkt", "punkt"),
         ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
+        ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
     ]
     for path, name in resources:
         try:
             nltk.data.find(path)
         except LookupError:
-            nltk.download(name, quiet=True)
+            try:
+                nltk.download(name, quiet=True)
+            except Exception:
+                pass
 
 
 def get_stopwords_set():
@@ -62,33 +59,47 @@ def clean_text(
     normalize_spaces: bool = True,
 ) -> str:
     cleaned = text
+
     if lowercase:
         cleaned = cleaned.lower()
+
     if remove_punctuation:
         cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+
     if remove_special_chars:
         cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", cleaned)
+
     if remove_digits:
         cleaned = re.sub(r"\d+", " ", cleaned)
+
     if normalize_spaces:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
     return cleaned
 
 
 def get_removed_elements(original: str, cleaned: str) -> List[str]:
-    original_chars = list(original)
     cleaned_chars = set(cleaned)
     removed = []
-    for ch in original_chars:
+    for ch in original:
         if ch.strip() and ch not in cleaned_chars and ch not in removed:
             removed.append(ch)
     return removed
 
 
-def get_subword_tokenizer(model_name: str = "bert-base-uncased"):
-    if model_name not in _SUBWORD_TOKENIZER_CACHE:
-        _SUBWORD_TOKENIZER_CACHE[model_name] = AutoTokenizer.from_pretrained(model_name)
-    return _SUBWORD_TOKENIZER_CACHE[model_name]
+def simple_subword_tokenize(text: str) -> List[str]:
+    words = re.findall(r"\b\w+\b", text.lower())
+    tokens = []
+    for word in words:
+        if len(word) <= 4:
+            tokens.append(word)
+        else:
+            tokens.append(word[:3])
+            rest = word[3:]
+            chunk_size = 3
+            for i in range(0, len(rest), chunk_size):
+                tokens.append("##" + rest[i:i + chunk_size])
+    return tokens
 
 
 def tokenize_text(text: str, tokenization_type: str = "Word") -> List[str]:
@@ -97,11 +108,13 @@ def tokenize_text(text: str, tokenization_type: str = "Word") -> List[str]:
 
     if tokenization_type == "Word":
         return re.findall(r"\b\w+\b", text)
+
     if tokenization_type == "Character":
         return [ch for ch in text if not ch.isspace()]
+
     if tokenization_type == "Subword":
-        tokenizer = get_subword_tokenizer()
-        return tokenizer.tokenize(text)
+        return simple_subword_tokenize(text)
+
     return re.findall(r"\b\w+\b", text)
 
 
@@ -131,8 +144,10 @@ def remove_stopwords_and_normalize(
         for tok in tokens:
             keep = not (remove_stopwords and tok.lower() in stop_words)
             transformed = tok
+
             if keep:
                 processed.append(transformed)
+
             rows.append(
                 {
                     "Original Token": tok,
@@ -142,7 +157,14 @@ def remove_stopwords_and_normalize(
             )
         return processed, pd.DataFrame(rows)
 
-    pos_tags = nltk.pos_tag(tokens) if tokens else []
+    try:
+        pos_tags = nltk.pos_tag(tokens) if tokens else []
+    except LookupError:
+        ensure_nltk_resources()
+        try:
+            pos_tags = nltk.pos_tag(tokens) if tokens else []
+        except Exception:
+            pos_tags = [(tok, "NN") for tok in tokens]
 
     for tok, pos in pos_tags:
         keep = not (remove_stopwords and tok.lower() in stop_words)
@@ -153,6 +175,7 @@ def remove_stopwords_and_normalize(
                 transformed = _STEMMER.stem(tok)
             elif normalization_method == "Lemmatization":
                 transformed = _LEMMATIZER.lemmatize(tok, nltk_pos_to_wordnet(pos))
+
             processed.append(transformed)
 
         rows.append(
@@ -173,9 +196,17 @@ def build_vocabulary(tokens: List[str]) -> pd.DataFrame:
 
     counts = Counter(tokens)
     sorted_tokens = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+
     rows = []
     for idx, (token, freq) in enumerate(sorted_tokens):
-        rows.append({"Index": idx, "Token": token, "Frequency": freq})
+        rows.append(
+            {
+                "Index": idx,
+                "Token": token,
+                "Frequency": freq,
+            }
+        )
+
     return pd.DataFrame(rows)
 
 
@@ -194,22 +225,18 @@ def vectorize_corpus(corpus: List[str], method: str = "TF-IDF"):
     matrix = vectorizer.fit_transform(docs)
     feature_names = vectorizer.get_feature_names_out().tolist()
     df = pd.DataFrame(matrix.toarray(), columns=feature_names)
+
     return df, feature_names, label
 
 
-def get_sentence_model(model_name: str = "all-MiniLM-L6-v2"):
-    if model_name not in _SENTENCE_MODEL_CACHE:
-        _SENTENCE_MODEL_CACHE[model_name] = SentenceTransformer(model_name)
-    return _SENTENCE_MODEL_CACHE[model_name]
-
-
-def get_sentence_embeddings(sentences: List[str], model_name: str = "all-MiniLM-L6-v2") -> np.ndarray:
+def get_sentence_embeddings(sentences: List[str], model_name: str = "tfidf-demo") -> np.ndarray:
     docs = [s for s in sentences if isinstance(s, str) and s.strip()]
     if not docs:
         return np.zeros((1, 1))
-    model = get_sentence_model(model_name)
-    embeddings = model.encode(docs)
-    return np.array(embeddings)
+
+    vectorizer = TfidfVectorizer()
+    matrix = vectorizer.fit_transform(docs)
+    return matrix.toarray()
 
 
 def reduce_embeddings_2d(embeddings: np.ndarray, labels: List[str]):
@@ -218,15 +245,29 @@ def reduce_embeddings_2d(embeddings: np.ndarray, labels: List[str]):
 
     if embeddings.shape[0] == 1:
         return pd.DataFrame(
-            {"x": [0.0], "y": [0.0], "label": [labels[0]], "label_short": [shorten_text(labels[0])]}
+            {
+                "x": [0.0],
+                "y": [0.0],
+                "label": [labels[0]],
+                "label_short": [shorten_text(labels[0])],
+            }
         )
 
-    pca = PCA(n_components=2)
+    n_components = 2 if embeddings.shape[1] >= 2 else 1
+    pca = PCA(n_components=n_components)
     reduced = pca.fit_transform(embeddings)
+
+    if n_components == 1:
+        x_vals = reduced[:, 0]
+        y_vals = np.zeros(len(x_vals))
+    else:
+        x_vals = reduced[:, 0]
+        y_vals = reduced[:, 1]
+
     return pd.DataFrame(
         {
-            "x": reduced[:, 0],
-            "y": reduced[:, 1],
+            "x": x_vals,
+            "y": y_vals,
             "label": labels,
             "label_short": [shorten_text(label) for label in labels],
         }
@@ -238,70 +279,62 @@ def cosine_similarity_score(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
     return float(sim)
 
 
-def get_context_model(model_name: str = "distilbert-base-uncased"):
-    if model_name not in _CONTEXT_MODEL_CACHE:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
-        model.eval()
-        _CONTEXT_MODEL_CACHE[model_name] = (tokenizer, model)
-    return _CONTEXT_MODEL_CACHE[model_name]
-
-
 def extract_contextual_embeddings(sentence_a: str, sentence_b: str, target_word: str):
-    tokenizer, model = get_context_model()
+    token_a = target_word.lower()
+    token_b = target_word.lower()
 
-    result_a = _extract_word_vector(sentence_a, target_word, tokenizer, model)
-    result_b = _extract_word_vector(sentence_b, target_word, tokenizer, model)
+    tokens_a = re.findall(r"\b\w+\b", sentence_a.lower())
+    tokens_b = re.findall(r"\b\w+\b", sentence_b.lower())
 
-    if result_a is None or result_b is None:
+    if token_a not in tokens_a or token_b not in tokens_b:
         return {
             "found": False,
-            "message": f"Could not reliably find '{target_word}' in both sentences using the tokenizer.",
+            "message": f"Could not find '{target_word}' in both sentences.",
         }
 
-    sim = cosine_similarity([result_a["vector"]], [result_b["vector"]])[0][0]
+    index_a = tokens_a.index(token_a)
+    index_b = tokens_b.index(token_b)
+
+    context_vec_a = build_context_vector(tokens_a, index_a)
+    context_vec_b = build_context_vector(tokens_b, index_b)
+
+    similarity = cosine_similarity([context_vec_a], [context_vec_b])[0][0]
+
     return {
         "found": True,
-        "index_a": result_a["index"],
-        "index_b": result_b["index"],
-        "token_a": result_a["token"],
-        "token_b": result_b["token"],
-        "similarity": float(sim),
+        "index_a": index_a,
+        "index_b": index_b,
+        "token_a": target_word,
+        "token_b": target_word,
+        "similarity": float(similarity),
     }
 
 
-def _extract_word_vector(sentence: str, target_word: str, tokenizer, model):
-    encoded = tokenizer(sentence, return_tensors="pt")
-    tokens = tokenizer.convert_ids_to_tokens(encoded["input_ids"][0])
-    target_pieces = tokenizer.tokenize(target_word.lower())
+def build_context_vector(tokens: List[str], index: int, window: int = 2) -> np.ndarray:
+    left = tokens[max(0, index - window):index]
+    right = tokens[index + 1:index + 1 + window]
+    context = left + right
 
-    token_strings = [t.lower() for t in tokens]
-    match_index = _find_sublist(token_strings, target_pieces)
-    if match_index == -1:
-        return None
+    if not context:
+        return np.zeros(5)
 
-    with torch.no_grad():
-        outputs = model(**encoded)
-        hidden = outputs.last_hidden_state[0]
-
-    span_vectors = hidden[match_index : match_index + len(target_pieces)]
-    vector = span_vectors.mean(dim=0).cpu().numpy()
-    matched_token = " ".join(tokens[match_index : match_index + len(target_pieces)])
-    return {"index": int(match_index), "token": matched_token, "vector": vector}
-
-
-def _find_sublist(tokens: List[str], target: List[str]) -> int:
-    if not target:
-        return -1
-    for i in range(len(tokens) - len(target) + 1):
-        if tokens[i : i + len(target)] == target:
-            return i
-    return -1
+    features = np.array(
+        [
+            len(context),
+            sum(len(tok) for tok in context) / len(context),
+            sum(1 for tok in context if tok in get_stopwords_set()),
+            sum(1 for tok in context if tok.isalpha()),
+            sum(ord(tok[0]) for tok in context) / len(context),
+        ],
+        dtype=float,
+    )
+    return features
 
 
 def tokens_to_display_html(tokens: List[str]) -> str:
     if not tokens:
         return "<p><i>No tokens generated.</i></p>"
+
     chips = []
     for tok in tokens:
         chips.append(
